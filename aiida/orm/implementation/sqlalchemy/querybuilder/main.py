@@ -9,14 +9,18 @@
 ###########################################################################
 # pylint: disable=too-many-lines
 """Sqla query builder implementation"""
+from contextlib import contextmanager
 from functools import partial
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, cast, Dict, Iterable, Iterator, List, Optional
 import uuid
+import warnings
 
 from sqlalchemy import and_, or_, not_, func as sa_func
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import SAWarning
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, loading
+from sqlalchemy.orm.context import ORMCompileState, QueryContext
 from sqlalchemy.orm.query import Query
 from sqlalchemy.orm.session import Session
 from sqlalchemy.orm.util import AliasedClass
@@ -31,7 +35,7 @@ from aiida.orm.implementation.querybuilder import (BackendQueryBuilder, EntityTy
 from .joiner import SqlaJoiner
 
 
-class jsonb_array_length(FunctionElement):  # pylint: disable=invalid-name
+class jsonb_array_length(FunctionElement):  # pylint: disable=abstract-method,invalid-name
     name = 'jsonb_array_len'
 
 
@@ -43,7 +47,7 @@ def compile(element, compiler: TypeCompiler, **kwargs):  # pylint: disable=funct
     return f'jsonb_array_length({compiler.process(element.clauses, **kwargs)})'
 
 
-class array_length(FunctionElement):  # pylint: disable=invalid-name
+class array_length(FunctionElement):  # pylint: disable=abstract-method,invalid-name
     name = 'array_len'
 
 
@@ -55,7 +59,7 @@ def compile(element, compiler: TypeCompiler, **kwargs):  # pylint: disable=funct
     return f'array_length({compiler.process(element.clauses, **kwargs)})'
 
 
-class jsonb_typeof(FunctionElement):  # pylint: disable=invalid-name
+class jsonb_typeof(FunctionElement):  # pylint: disable=abstract-method,invalid-name
     name = 'jsonb_typeof'
 
 
@@ -65,6 +69,35 @@ def compile(element, compiler: TypeCompiler, **kwargs):  # pylint: disable=funct
     Get length of array defined in a JSONB column
     """
     return f'jsonb_typeof({compiler.process(element.clauses, **kwargs)})'
+
+
+def _orm_setup_cursor_result(
+    session,
+    statement,
+    params,
+    execution_options,
+    bind_arguments,
+    result,
+):
+    """Patched class method."""
+    execution_context = result.context
+    compile_state = execution_context.compiled.compile_state
+
+    # this is the patch required for turning off de-duplication of results
+    compile_state._has_mapper_entities = False  # pylint: disable=protected-access
+
+    load_options = execution_options.get('_sa_orm_load_options', QueryContext.default_load_options)
+
+    querycontext = QueryContext(
+        compile_state,
+        statement,
+        params,
+        session,
+        load_options,
+        execution_options,
+        bind_arguments,
+    )
+    return loading.instances(result, querycontext)
 
 
 class SqlaQueryBuilder(BackendQueryBuilder):
@@ -83,11 +116,10 @@ class SqlaQueryBuilder(BackendQueryBuilder):
         # CACHING ATTRIBUTES
         # cache of tag mappings to aliased classes, populated during appends (edges populated during build)
         self._tag_to_alias: Dict[str, Optional[AliasedClass]] = {}
-        # mapping that helps the projection postprocessing: projection_index -> field
-        # populated on query build
-        self._projection_index_to_field: Optional[Dict[int, str]] = None
-        # mapping of tag -> field -> projection_index
-        # populated on query build
+
+        # total number of requested projections, and mapping of tag -> field -> projection_index
+        # populated on query build and used by "return" methods (`one`, `iterall`, `iterdict`)
+        self._requested_projections: int = 0
         self._tag_to_projected_fields: Dict[str, Dict[str, int]] = {}
 
         # table -> field -> field
@@ -169,117 +201,75 @@ class SqlaQueryBuilder(BackendQueryBuilder):
         return self._backend.get_session()
 
     def count(self, data: QueryDictType) -> int:
-        query = self.update_query(data)
-        try:
-            return query.count()
-        except Exception:
-            self.get_session().close()
-            raise
-
-    def yield_per(self, data: QueryDictType, batch_size):
-        query = self.update_query(data)
-        try:
-            return query.yield_per(batch_size)
-        except Exception:
-            self.get_session().close()
-            raise
+        with self.use_query(data) as query:
+            result = query.count()
+        return result
 
     def first(self, data: QueryDictType) -> Optional[List[Any]]:
-        query = self.update_query(data)
-        try:
+        with self.use_query(data) as query:
             result = query.first()
-        except Exception:
-            self.get_session().close()
-            raise
 
         if result is None:
             return result
 
-        if not isinstance(result, (list, tuple)):
-            result = [result]
+        # we discard the first item of the result row,
+        # which was what the query was initialised with and not one of the requested projection (see self._build)
+        result = result[1:]
 
-        if not self._projection_index_to_field or len(result) != len(self._projection_index_to_field):
-            raise Exception('length of query result does not match the number of specified projections')
+        if len(result) != self._requested_projections:
+            raise Exception(
+                f'length of query result ({len(result)}) does not match '
+                f'the number of specified projections ({self._requested_projections})'
+            )
 
-        return [self.to_backend(rowitem) for rowitem in result]
+        return [self.to_backend(r) for r in result]
 
     def iterall(self, data: QueryDictType, batch_size: Optional[int]) -> Iterable[List[Any]]:
         """Return an iterator over all the results of a list of lists."""
-        query = self.update_query(data)
-        tag_to_index_dict = self._projection_index_to_field
-        try:
-            if not tag_to_index_dict:
-                raise Exception(f'Got an empty dictionary: {tag_to_index_dict}')
+        with self.use_query(data) as query:
 
-            results = query.yield_per(batch_size)
-
-            if len(tag_to_index_dict) == 1:
-                # Sqlalchemy, for some strange reason, does not return a list of lsits
-                # if you have provided an ormclass
-
-                if list(tag_to_index_dict.values()) == ['*']:
-                    for rowitem in results:
-                        yield [self.to_backend(rowitem)]
-                else:
-                    for rowitem, in results:
-                        yield [self.to_backend(rowitem)]
-            elif len(tag_to_index_dict) > 1:
-                for resultrow in results:
-                    yield [self.to_backend(rowitem) for rowitem in resultrow]
-            else:
-                raise ValueError('Got an empty dictionary')
-        except Exception:
-            self.get_session().close()
-            raise
+            for resultrow in query.yield_per(batch_size):  # pylint: disable=not-an-iterable
+                # we discard the first item of the result row,
+                # which is what the query was initialised with
+                # and not one of the requested projection (see self._build)
+                resultrow = resultrow[1:]
+                yield [self.to_backend(rowitem) for rowitem in resultrow]
 
     def iterdict(self, data: QueryDictType, batch_size: Optional[int]) -> Iterable[Dict[str, Dict[str, Any]]]:
         """Return an iterator over all the results of a list of dictionaries."""
-        query = self.update_query(data)
+        with self.use_query(data) as query:
+
+            for row in query.yield_per(batch_size):  # pylint: disable=not-an-iterable
+                # build the yield result
+                yield_result: Dict[str, Dict[str, Any]] = {}
+                for tag, projected_entities_dict in self._tag_to_projected_fields.items():
+                    yield_result[tag] = {}
+                    for attrkey, project_index in projected_entities_dict.items():
+                        field_name = self.get_corresponding_property(
+                            self.get_table_name(self._get_tag_alias(tag)), attrkey, self.inner_to_outer_schema
+                        )
+                        yield_result[tag][field_name] = self.to_backend(row[project_index])
+                yield yield_result
+
+    @contextmanager
+    def use_query(self, data: QueryDictType) -> Iterator[Query]:
+        """Yield the built query."""
+        # Currently, a monkey-patch is required to turn off de-duplication of results,
+        # carried out in the `use_query` method
+        # see: https://github.com/sqlalchemy/sqlalchemy/issues/4395#issuecomment-907293360
+        # THIS CAN BE REMOVED WHEN MOVING TO THE VERSION 2 API
+        existing_func = ORMCompileState.orm_setup_cursor_result
+        ORMCompileState.orm_setup_cursor_result = _orm_setup_cursor_result
+        query = self._update_query(data)
         try:
-            nr_items = sum(len(v) for v in self._tag_to_projected_fields.values())
-
-            if not nr_items:
-                raise ValueError('Got an empty dictionary')
-
-            results = query.yield_per(batch_size)
-            if nr_items > 1:
-                for this_result in results:
-                    yield {
-                        tag: {
-                            self.get_corresponding_property(
-                                self.get_table_name(self._get_tag_alias(tag)), attrkey, self.inner_to_outer_schema
-                            ): self.to_backend(this_result[index_in_sql_result])
-                            for attrkey, index_in_sql_result in projected_entities_dict.items()
-                        } for tag, projected_entities_dict in self._tag_to_projected_fields.items()
-                    }
-            elif nr_items == 1:
-                # I this case, sql returns a  list, where each listitem is the result
-                # for one row. Here I am converting it to a list of lists (of length 1)
-                if [v for entityd in self._tag_to_projected_fields.values() for v in entityd.keys()] == ['*']:
-                    for this_result in results:
-                        yield {
-                            tag: {
-                                self.get_corresponding_property(
-                                    self.get_table_name(self._get_tag_alias(tag)), attrkey, self.inner_to_outer_schema
-                                ): self.to_backend(this_result) for attrkey, position in projected_entities_dict.items()
-                            } for tag, projected_entities_dict in self._tag_to_projected_fields.items()
-                        }
-                else:
-                    for this_result, in results:
-                        yield {
-                            tag: {
-                                self.get_corresponding_property(
-                                    self.get_table_name(self._get_tag_alias(tag)), attrkey, self.inner_to_outer_schema
-                                ): self.to_backend(this_result) for attrkey, position in projected_entities_dict.items()
-                            } for tag, projected_entities_dict in self._tag_to_projected_fields.items()
-                        }
-            else:
-                raise ValueError('Got an empty dictionary')
+            yield query
         except Exception:
             self.get_session().close()
             raise
+        finally:
+            ORMCompileState.orm_setup_cursor_result = existing_func
 
-    def update_query(self, data: QueryDictType) -> Query:
+    def _update_query(self, data: QueryDictType) -> Query:
         """Return the sqlalchemy.orm.Query instance for the current query specification.
 
         To avoid unnecessary re-builds of the query, the hashed dictionary representation of this instance
@@ -312,7 +302,13 @@ class SqlaQueryBuilder(BackendQueryBuilder):
         }
         self._tag_to_alias = {}
         for path in self._data['path']:
-            self._tag_to_alias[path['tag']] = aliased(cls_map[path['orm_base']])
+            # An SAWarning warning is currently emitted:
+            # "relationship 'DbNode.input_links' will copy column db_dbnode.id to column db_dblink.output_id,
+            # which conflicts with relationship(s): 'DbNode.outputs' (copies db_dbnode.id to db_dblink.output_id)"
+            # This should be eventually fixed
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=SAWarning)
+                self._tag_to_alias[path['tag']] = aliased(cls_map[path['orm_base']])
 
     def _get_tag_alias(self, tag: str) -> AliasedClass:
         """Get the alias of a tag"""
@@ -325,14 +321,19 @@ class SqlaQueryBuilder(BackendQueryBuilder):
         """
         build the query and return a sqlalchemy.Query instance
         """
-        # pylint: disable=too-many-branches
+        # pylint: disable=too-many-branches,too-many-locals
         self.rebuild_aliases()
-        # Starting the query by receiving a session
-        # Every subclass needs to have _get_session and give me the right session
+        # Start the build by generating a query from the current session,
+        # A query must always be initialised with a starting entity or column (to allow joins),
+        # however, we don't actually want to return this, since we set projections explicitly.
+        # Therefore, we just add the id field (as we don't want to retrive the entire entity from the database),
+        # and then remove it in the "return" methods (`one`, `iterall`, `iterdict`)
         firstalias = self._get_tag_alias(self._data['path'][0]['tag'])
-        self._query = self.get_session().query(firstalias)
+        # we assume here that every table has an 'id' column (currently the case)
+        self._query = self.get_session().query(firstalias.id)
 
         # JOINS ################################
+
         # Start on second path item, since there is nothing to join if that is the first table
         for index, verticespec in enumerate(self._data['path'][1:], start=1):
             join_to = self._get_tag_alias(verticespec['tag'])
@@ -355,7 +356,7 @@ class SqlaQueryBuilder(BackendQueryBuilder):
             if result.aliased_edge is not None:
                 self._tag_to_alias[edge_tag] = result.aliased_edge
 
-        ######################### FILTERS ##############################
+        # FILTERS ##############################
 
         for tag, filter_specs in self._data['filters'].items():
             if not filter_specs:
@@ -366,16 +367,13 @@ class SqlaQueryBuilder(BackendQueryBuilder):
                 raise ValueError(f'Unknown tag {tag!r} in filters, known: {list(self._tag_to_alias)}')
             self._query = self._query.filter(self.build_filters(alias, filter_specs))
 
-        ######################### PROJECTIONS ##########################
-        # first clear the entities in the case the first item in the
-        # path was not meant to be projected
-        # attribute of Query instance storing entities to project:
+        # PROJECTIONS ##########################
 
-        # Mapping between entities and the tag used/ given by user:
+        # Reset mapping of tag -> field -> projection_index
         self._tag_to_projected_fields = {}
 
-        projection_count = 0
-        QUERYBUILD_LOGGER.debug('self._data["project"]: %s', self._data['project'])
+        projection_count = 1
+        QUERYBUILD_LOGGER.debug('projections data: %s', self._data['project'])
 
         if not any(self._data['project'].values()):
             # If user has not set projection,
@@ -402,6 +400,17 @@ class SqlaQueryBuilder(BackendQueryBuilder):
                 if edge_tag is not None:
                     projection_count = self._build_projections(edge_tag, projection_count)
 
+        # check the consistency of projections
+        projection_index_to_field = {
+            index_in_sql_result: attrkey for _, projected_entities_dict in self._tag_to_projected_fields.items()
+            for attrkey, index_in_sql_result in projected_entities_dict.items()
+        }
+        if (projection_count - 1) > len(projection_index_to_field):
+            raise ValueError('You are projecting the same key multiple times within the same node')
+        if not projection_index_to_field:
+            raise ValueError('No projections requested')
+        self._requested_projections = projection_count - 1
+
         # ORDER ################################
         for order_spec in self._data['order_by']:
             for tag, entity_list in order_spec.items():
@@ -414,37 +423,13 @@ class SqlaQueryBuilder(BackendQueryBuilder):
         if self._data['limit'] is not None:
             self._query = self._query.limit(self._data['limit'])
 
-        ######################## OFFSET ################################
+        # OFFSET ################################
         if self._data['offset'] is not None:
             self._query = self._query.offset(self._data['offset'])
 
-        ################ LAST BUT NOT LEAST ############################
-        # pop the entity that I added to start the query
-        self._query._entities.pop(0)  # pylint: disable=protected-access
-
-        # Dirty solution coming up:
-        # Sqlalchemy is by default de-duplicating results if possible.
-        # This can lead to strange results, as shown in:
-        # https://github.com/aiidateam/aiida-core/issues/1600
-        # essentially qb.count() != len(qb.all()) in some cases.
-        # We also addressed this with sqlachemy:
-        # https://github.com/sqlalchemy/sqlalchemy/issues/4395#event-2002418814
-        # where the following solution was sanctioned:
-        self._query._has_mapper_entities = False  # pylint: disable=protected-access
-        # We should monitor SQLAlchemy, for when a solution is officially supported by the API!
-
-        # Make a list that helps the projection postprocessing
-        self._projection_index_to_field = {
-            index_in_sql_result: attrkey for tag, projected_entities_dict in self._tag_to_projected_fields.items()
-            for attrkey, index_in_sql_result in projected_entities_dict.items()
-        }
-
-        if projection_count > len(self._projection_index_to_field):
-            raise ValueError('You are projecting the same key multiple times within the same node')
-        ######################### DONE #################################
-
+        # DISTINCT #################################
         if self._data['distinct']:
-            self._query = self._query.distinct()
+            self._query = cast(Query, self._query.distinct())
 
         return self._query
 
@@ -1057,18 +1042,18 @@ class SqlaQueryBuilder(BackendQueryBuilder):
         return _Compiler(dialect, query.statement, compile_kwargs=dict(literal_binds=literal_binds))
 
     def as_sql(self, data: QueryDictType, inline: bool = False) -> str:
-        query = self.update_query(data)
-        compiled = self._compile_query(query, literal_binds=inline)
+        with self.use_query(data) as query:
+            compiled = self._compile_query(query, literal_binds=inline)
         if inline:
             return compiled.string + '\n'
         return f'{compiled.string!r} % {compiled.params!r}\n'
 
     def analyze_query(self, data: QueryDictType, execute: bool = True, verbose: bool = False) -> str:
-        query = self.update_query(data)
-        if query.session.bind.dialect.name != 'postgresql':
-            raise NotImplementedError('Only PostgreSQL is supported for this method')
-        compiled = self._compile_query(query, literal_binds=True)
+        with self.use_query(data) as query:
+            if query.session.bind.dialect.name != 'postgresql':
+                raise NotImplementedError('Only PostgreSQL is supported for this method')
+            compiled = self._compile_query(query, literal_binds=True)
         options = ', '.join((['ANALYZE'] if execute else []) + (['VERBOSE'] if verbose else []))
         options = f' ({options})' if options else ''
         rows = self.get_session().execute(f'EXPLAIN{options} {compiled.string}').fetchall()
-        return '\n'.join(row.values()[0] for row in rows)
+        return '\n'.join(row[0] for row in rows)
